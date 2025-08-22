@@ -1,7 +1,7 @@
 name: test-conditional-input
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       deploy-description:
         description: "Deploy Comments/Notes"
