@@ -17,4 +17,4 @@ jobs:
         run: echo "This is a test for conditional Delpoy Description.\nDeploy Description:${{ inputs.deploy-description }}"
       - name: Test Without Deploy Description
         if: ${{ inputs.deploy-description == '' }}
-        run: echo "This is a test for conditional Delpoy Description.\nDeploy Description:${{ inputs.deploy-description }}"
+        run: echo "This is a test for conditional Delpoy Description with empty description.\nDeploy Description:${{ inputs.deploy-description }}"
