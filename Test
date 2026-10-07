@@ -1,0 +1,703 @@
+
+1. Reference architecture
+The following is a proposed implementation blueprint. It fits a Python/LangGraph orchestration service behind your existing Spring Boot APIs.
+Underwriter UI / Submission API / Business-question API
+                         |
+                 Underwriting Gateway
+            Authentication • Tenant • Authorization
+                         |
+                  Assessment Service
+           Request validation • Run ID • Idempotency
+                         |
+              Workflow / Agent Orchestrator
+                         |
+       +-----------------+------------------+
+       |                 |                  |
+  Intent Planner    Policy Router      State Manager
+  Question → facts  Allowed tools      Checkpoints
+  needed            Dependencies       Review/resume
+       |                 |                  |
+       +-----------------+------------------+
+                         |
+                   Tool Gateway
+          Typed schemas • Timeouts • Retries
+          Access controls • Response validation
+                         |
+       +-----------------+------------------+
+       |                 |                  |
+ Business Discovery   Appetite API      Loss History API
+       |                 |                  |
+       +-----------------+------------------+
+                         |
+                Evidence / Fact Store
+                         |
+            Risk Analysis → Output Validator
+                         |
+          Underwriter Report / Chat Response
+                         |
+             Human Review / Decision Record
+
+Across all components:
+Workflow events • OpenTelemetry traces • Audit records
+
+
+Component responsibilities
+Component
+Responsibility
+Important boundary
+Assessment service
+Creates full assessments and standalone question runs.
+Chat is not the durable workflow record.
+Intent planner
+Converts a question into required evidence and proposed tool calls.
+Cannot invent tools or relax policy.
+Policy router
+Validates tool selection, prerequisites, permissions, freshness, and budgets.
+Owns actual execution authority.
+Business resolver
+Matches the address to a business, legal entity, and operating location.
+Address alone does not establish identity.
+Appetite evaluator
+Calls the appetite API with validated classification and effective date.
+Preserves its returned category exactly.
+Loss analyst
+Normalizes and evaluates the retrieved loss history.
+Distinguishes missing records from verified absence of losses.
+Risk analyst
+Synthesizes supported exposures, mitigating factors, and unanswered questions.
+Cannot override appetite or bind coverage.
+Output validator
+Checks source support, contradictions, schema validity, and completeness.
+Blocks unsupported conclusions.
+Review service
+Handles identity clarification, data conflicts, referrals, and overrides.
+Changes require authorized users and recorded reasons.
+
+
+These can be logical modules within one service initially. Separate agents or microservices are only necessary when they improve ownership, deployment, or isolation.
+For human review, LangGraph supports persisted interrupts and resuming the same thread; production use requires a durable checkpointer. Add a worker/recovery mechanism to resume failed or waiting runs rather than treating checkpoint storage as the complete execution platform.[1][2]
+2. Data and API contracts
+Assessment input
+Your minimum request can contain an address, class code, and effective date. Include a business name or identifier when available to reduce ambiguity.
+{
+  "mode": "FULL_ASSESSMENT",
+  "business": {
+    "name": "Example Fabrication LLC",
+    "address": {
+      "street": "123 Example Road",
+      "city": "Bentonville",
+      "state": "AR",
+      "postal_code": "72712",
+      "country": "US"
+    },
+    "business_id": null
+  },
+  "classification": {
+    "class_code": "PROVIDER_SPECIFIC_CODE",
+    "code_system": "CARRIER_CLASS",
+    "source": "UNDERWRITER"
+  },
+  "effective_date": "2026-11-01",
+  "line_of_business": "GENERAL_LIABILITY",
+  "question": null
+}
+
+
+Important design choices:
+Keep class codes as strings, preserving leading zeros.
+Require a code-system identifier; do not silently treat a carrier code, NAICS code, and another classification system as interchangeable.
+Treat supplied classification as an input assertion and compare it with discovered operations.
+Require effective_date for appetite analysis rather than silently using today.
+Include product, jurisdiction, and carrier/program identifiers if the appetite API uses them.
+Obtain tenant identity and user permissions from authentication—not model-generated arguments.
+Tool contracts
+Use typed wrappers around the existing APIs:
+Tool
+Required inputs
+Normalized output
+discover_business
+Address; optional business name or ID
+Candidate entities, locations, operations, provider IDs, match evidence, observation dates
+get_appetite
+Class code, code system, effective date; applicable product/jurisdiction fields
+Exact category, rule ID/version, validity dates, conditions, source metadata
+get_loss_history
+Confirmed entity ID, authorized scope, requested period, as-of date
+Claims, financial amounts, valuation dates, coverage periods, completeness status
+
+
+The discovery result should distinguish a legal entity from an operating location. The loss-history adapter should indicate whether records describe that location, the entire business, or another scope.
+An appetite response should look like:
+{
+  "lookup_status": "FOUND",
+  "category": "Acceptable",
+  "rule_id": "APP-482",
+  "rule_version": "17",
+  "valid_from": "2026-01-01",
+  "valid_to": "2026-12-31",
+  "conditions": [],
+  "evaluated_inputs": {
+    "class_code": "PROVIDER_SPECIFIC_CODE",
+    "code_system": "CARRIER_CLASS",
+    "effective_date": "2026-11-01"
+  }
+}
+
+
+Keep category limited to your exact values:
+ | 
+
+
+Represent lookup failure separately:
+{
+  "lookup_status": "NOT_FOUND",
+  "category": null
+}
+
+
+Do not turn a timeout, unknown class code, or absent rule into Undesirable.
+Evidence model
+Store facts separately from generated narrative:
+{
+  "fact_id": "fact-104",
+  "subject_id": "business-229",
+  "field": "operations.welding",
+  "value": true,
+  "source_tool": "discover_business",
+  "source_record_id": "provider-record-882",
+  "retrieved_at": "2026-10-06T20:09:00Z",
+  "observed_at": "2026-09-28",
+  "verification_status": "PROVIDER_REPORTED",
+  "scope": "LOCATION",
+  "conflicts_with": []
+}
+
+
+Every material finding should reference fact IDs. Distinguish:
+Provider-reported fact.
+-confirmed fact.
+Deterministically calculated metric.
+Model inference.
+Hypothetical assumption.
+Historical analysis also needs a temporal distinction: the proposed policy effective date, the loss valuation date, and the date information became known are not the same. An appetite rule valid on an effective date does not by itself make the entire assessment a historical reconstruction.
+3. Smart routing and execution
+Use a hybrid router: the LLM interprets the question, while deterministic policies validate and execute the plan.
+Routing examples
+Request
+Required tools
+Calls deliberately omitted
+“Assess this business.”
+Discovery → app and losses after prerequisites are met
+Optional enrichment unless a material evidence gap warrants it
+“Is this class in appetite on November 1?”
+Appetite; discovery only if identity/classification needs resolution
+Loss history
+“What concerns appear in its loss history?”
+Loss history; discovery if no confirmed entity ID exists
+Appetite unless eligibility is also requested
+“Does this business actually perform welding?”
+Business discovery
+Appetite and losses
+“Why did you recommend referral?”
+Read the assessment and supporting evidence
+New external calls unless evidence needs refreshing
+“What if the business stops welding?”
+Scenario branch using existing evidence; appetite lookup if approved reclassification is required
+Changes to the actual business record
+
+
+Do not make every question trigger the entire assessment.
+Execution sequence
+Validate the request and determine whether it is a full assessment, focused question, explanation, or hypothetical scenario.
+Resolve the business identity when required.
+Check the supplied class code against discovered operations; request review for material discrepancies.
+Build a dependency plan with required and optional tools.
+Execute independent calls concurrently when their prerequisites are satisfied.
+Normalize results into evidence records.
+Calculate approved loss metrics outside the LLM.
+Identify unresolved contradictions and missing evidence.
+Generate the risk analysis from the evidence bundle.
+Validate and either publish the response or pause for review.
+An appetite lookup may run alongside discovery when its inputs are already authoritative. However, do not publish a business-specific conclusion until identity and classification consistency checks pass.
+Router output
+{
+  "intent": "LOSS_RISK_QUESTION",
+  "required_facts": [
+    "confirmed_business_identity",
+    "loss_history",
+    "loss_history_coverage"
+  ],
+  "plan": [
+    {
+      "tool": "discover_business",
+      "condition": "confirmed_business_id_missing"
+    },
+    {
+      "tool": "get_loss_history",
+      "depends_on": ["confirmed_business_identity"]
+    }
+  ],
+  "omitted_tools": [
+    {
+      "tool": "get_appetite",
+      "reason": "Question does not request appetite or eligibility"
+    }
+  ],
+  "output_scope": "LOSS_HISTORY_ONLY"
+}
+
+
+This is a proposed plan, not permission to execute. The policy router must enforce the registered tool schema, user access, data scope, dependencies, and call limits.
+Guardrails
+Use an allowlisted tool registry; never allow arbitrary URLs or model-written API requests.
+Treat provider content as evidence, not instructions to the agent.
+Retry transient failures within a bounded budget; do not retry authorization failures indefinitely.
+Cache only within approved tenant boundaries, source-use terms, and freshness windows.
+Record cache use and original retrieval time.
+Replan only when new evidence introduces a material gap.
+Stop when required evidence is complete, blocked, unavailable, or the budget is exhausted.
+Require review for ambiguous identity, conflicting classifications, incomplete critical evidence, or unauthorized decision requests.
+Define completeness by intent. A focused appetite question can be complete without losses; a full assessment may not be.
+4. Analysis and underwriter experience
+Keep three outputs separate
+Output
+Source
+Example
+Appetite
+Authoritative appetite API
+Acceptable
+Risk assessment
+Evidence synthesis and approved calculations
+Recurring fire-related losses; mitigation evidence missing
+Disposition recommendation
+Carrier-approved decision policy
+REFER
+
+
+A business can be Preferred by appetite and still require referral because of its individual loss experience. Conversely, favorable risk characteristics must not cause the model to change an Undesirable appetite result.
+Define how Undesirable maps to workflow behavior in a governed carrier policy; do not assume it always means automatic decline.
+Loss analysis
+Normalize financial fields before calculating metrics:
+Paid indemnity and paid expense.
+Outstanding indemnity and expense reserves.
+Recoveries, where supplied.
+Provider-reported incurred amount.
+Loss date, report date, claim status, and valuation date.
+Coverage line and location/entity scope.
+Use provider definitions to avoid adding reserves twice to an already-incurred total. Report frequency and severity with the observed period and scope. Do not calculate a loss ratio without the appropriate earned-premium denominator.
+The LLM should explain calculated patterns—not perform the underlying financial aggregation.
+Assessment response
+{
+  "assessment_id": "assessment-1042",
+  "status": "COMPLETED_WITH_GAPS",
+  "business_resolution": {
+    "business_id": "business-229",
+    "status": "CONFIRMED"
+  },
+  "appetite": {
+    "category": "Accept",
+    "rule_id": "APP-482",
+    "rule_version": "17"
+  },
+  "risk_analysis": {
+    "findings": [
+      {
+        "finding_id": "finding-1",
+        "description": "Repeated fire-related losses warrant review.",
+        "evidence_ids": ["loss-11", "loss-18"],
+        "type": "SUPPORTED_INFERENCE"
+      }
+    ],
+    "missing_information": [
+      "Evidence of corrective action after the latest fire loss"
+    ]
+  },
+  "recommendation": {
+    "disposition": "REFER",
+    "reason_codes": [
+      "REPEATED_FIRE_LOSSES",
+      "MITIGATION_NOT_VERIFIED"
+    ]
+  },
+  "decision": null
+}
+
+
+Standalone question analysis
+Expose focused questions as first-class runs:
+POST /v1/underwriting/questions
+
+
+{
+  "business_id": "business-229",
+  "question": "Do the losses indicate a recurring operational problem?",
+  "assessment_id": null,
+  "analysis_scope": "LOSS_HISTORY",
+  "refresh_policy": "IF_STALE"
+}
+
+
+A standalone run should work without an existing submission or assessment. If the question requires appetite, the service must obtain the relevant class code and effective date. If it concerns only loss patterns, it should not request irrelevant appetite inputs.
+For follow-up conversations, retain the business identity and referenced assessment, but create a new question-run ID and explicitly record which evidence was reused.
+Illustrative example
+Suppose discovery confirms a fabrication business, the appetite API returns Acceptable, and the loss API returns three claims over the supplied five-year period, including two fire-related claims.
+The answer might be:
+Appetite is  under the retrieved rule. The loss records suggest a recurring fire exposure, but they do not establish whether the underlying issue remains unresolved. Refer for review of corrective actions and current fire controls; the available evidence does not support binding or declining automatically.
+The report should display source links or internal evidence references next to each finding. These example facts are illustrative, not actual API results.
+The UI should offer a timeline, evidence panel, appetite rule details, findings, gaps, recommended questions, and an authorized decision panel—not just a chat transcript.
+5. Tracking, governance, and delivery
+Track three distinct layers
+Layer
+What it records
+Purpose
+Workflow state
+Current node, dependencies, waiting reason, retries, checkpoints
+Resume execution and show progress
+Technical telemetry
+Traces, spans, latency, errors, token consumption
+Troubleshoot and optimize
+Business audit
+Inputs, evidence versions, rules, findings, approvals, overrides
+Explain what informed a recommendation or decision
+
+
+Use a common run_id, assessment_id, and trace_id. OpenTelemetry propagates trace context across services so downstream API calls remain correlated with the originating request.[3][4]
+Do not use telemetry as the only audit record. Trace sampling and operational retention should not determine whether a decision can be explained.
+A workflow event might be:
+{
+  "event_id": "event-901",
+  "run_id": "run-1042",
+  "sequence": 7,
+  "event_type": "TOOL_COMPLETED",
+  "node": "loss_history",
+  "tool_call_id": "call-331",
+  "timestamp": "2026-10-06T20:09:02Z",
+  "input_reference": "request-331",
+  "output_reference": "evidence-bundle-331",
+  "routing_reason": "Required for full assessment",
+  "status": "SUCCESS",
+  "trace_id": "trace-1042"
+}
+
+
+Store concise routing reasons and evidence-backed explanations—not hidden model chain-of-thought. Version the prompt, model, tool adapter, decision policy, and appetite rule used for each run.
+Persistence and APIs
+A practical initial stack:
+Spring Boot gateway for authentication, authorization, and existing enterprise integration.
+Python/LangGraph service for routing and analysis.
+PostgreSQL for assessments, events, evidence metadata, and checkpoints.
+Encrypted object storage for permitted source-response snapshots.
+Queue-backed workers for execution, recovery, and resumptions.
+OpenTelemetry instrumentation across gateway, orchestrator, and tool adapters.
+Suggested service endpoints:
+POST /v1/underwriting/assessments
+GET  /v1/underwriting/assessments/{id}
+POST /v1/underwriting/questions
+GET  /v1/underwriting/runs/{id}
+GET  /v1/underwriting/runs/{id}/events
+POST /v1/underwriting/runs/{id}/resume
+POST /v1/underwriting/assessments/{id}/decisions
+
+
+Return a run ID immediately for asynchronous work. Stream progress through server-sent events or provide polling.
+Human decisions and overrides should preserve the original appetite result and recommendation, adding a separate decision record with actor, authority, timestamp, and reason.
+Governance and testing
+The NAIC AI Model Bulletin emphasizes governance, risk management, documentation, and controls for risks including inaccurate outcomes, unfair discrimination, and lack of explainability. Use it as a governance reference, while validating applicable jurisdiction-specific requirements with compliance.[5][6]
+Prioritize tests for:
+Multiple businesses at one address.
+Operations inconsistent with the supplied class code.
+Appetite validity-date boundaries.
+Loss-history timeout versus verified zero losses.
+Claims belonging to another entity or location.
+Duplicate claims and changing valuation dates.
+Unsupported findings or fabricated evidence references.
+Prompt injection embedded in discovery responses.
+Cross-tenant access attempts.
+Standalone questions calling unnecessary tools.
+Restart and resume without duplicate external writes.
+Measure tool-selection accuracy, evidence completeness, unsupported-claim rate, identity-resolution review rate, underwriter edits, latency, cost per assessment, and recovery success.
+Implementation sequence
+Build typed API adapters, normalized evidence schemas, and an auditable deterministic assessment workflow.
+Add question interpretation and policy-controlled tool routing.
+Add source-grounded risk narratives, output validation, and human review.
+Add caching, targeted replanning, recovery testing, and production evaluations.
+Expand optional enrichment only where it measurably improves risk assessment.
+The implementation principle is simple: give the agent flexibility in deciding what evidence to retrieve, but keep identity, appetite categories, calculations, permissions, and final underwriting authority under explicit control.
+⁂
+
+Write the complete implementation. I created the implementation as an additive package for your existing LangGraph application. The attached ZIP includes the underwriting graph, API adapters, standalone question analysis, durable worker, PostgreSQL persistence, human-review flow, audit events, and tests.
+It is a complete reference implementation with mock providers—not yet a production-validated integration with your actual APIs. All Python files passed syntax checks; runtime tests could not run here because LangGraph and the other required dependencies are unavailable.
+What’s included
+Module
+Implementation
+uw/graph.py
+Underwriting workflow and human-review nodes
+uw/models.py
+Typed requests, appetite responses, business discovery, loss history, and findings
+uw/tools.py
+Provider adapters, response validation, bounded retries, and replay caching
+uw/reasoning.py
+Structured intent interpretation, deterministic tool policy, loss calculations, and narrative synthesis
+uw/db.py
+Run records, durable jobs, audit events, and source-result storage
+uw/worker.py
+Job claiming, checkpoint recovery, review resumption, and bounded failure retries
+uw/api.py
+Submit, retrieve, inspect events, and resume endpoints
+uw/auth.py
+JWT verification, tenant identification, and permission checks
+uw/runtime.py
+Resource lifecycle and database initialization
+tests/test_graph.py
+Nine mock-backed tests covering routing, review, failures, and evidence validation
+
+
+The package also includes PostgreSQL Docker Compose configuration, environment settings, dependencies, a detailed integration README, and a validation report.
+The persistence implementation uses AsyncPostgresSaver, thread IDs, and LangGraph’s interrupt() / Command(resume=...) mechanism for review pauses. These follow LangGraph’s documented persistence and resumption interfaces.[21][22][23]
+Integrate with your app
+You do not need to replace your current orchestrator. The principal integration point is:
+from uw.graph import build_graph
+
+_graph = build_graph(
+    tools=your_tools,
+    reasoner=your_reasoner,
+    repo=your_run_repository,
+    checkpointer=your_existing_checkpointer,
+)
+
+
+You can invoke this as a separate underwriting workflow or incorporate it into your current graph.
+Add it as a subgraph
+If your parent graph shares compatible underwriting state fields:
+from uw.graph import build_graph
+
+underwriting_subgraph = build_graph(
+    tools=tools,
+    reasoner=reasoner,
+    repo=repo,
+    # Let the parent manage persistence.
+)
+
+parent_builder.add_node(
+    "underwriting",
+    underwriting_subgraph,
+)
+
+parent_builder.add_edge(
+    "business_intake",
+    "underwriting",
+)
+
+parent_builder.add_edge(
+    "underwriting",
+    "underwriter_output",
+)
+
+parent_graph = parent_builder.compile(
+    checkpointer=existing_checkpointer,
+)
+
+
+Before entering the subgraph, supply:
+{
+    "run_id": "...",
+    "tenant": "...",
+    "actor": "...",
+    "request": {
+        "mode": "FULL_ASSESSMENT",
+        "address": {...},
+        "class_code": "...",
+        "code_system": "...",
+        "effective_date": "2026-11-01",
+        "line_of_business": "GENERAL_LIABILITY",
+        "loss_start": "2021-01-01",
+        "loss_end": "2026-10-06"
+    }
+}
+
+
+Two integration requirements matter:
+Map your existing state to this schema if your field names differ.
+Register run_id in the supplied run repository, or replace Repo with your current tracking implementation.
+If the parent owns the interrupted thread, resume through the parent—not through the supplied standalone graph endpoint. LangGraph resumes require the persisted thread and a separate invocation using Command.[22]
+Preserve your existing tools and model
+The package isolates both integration seams:
+# Provider/tool interface
+await tools.call(
+    state,
+    name,
+    arguments,
+    response_schema,
+)
+
+# Model interface
+await reasoner.intent(request)
+await reasoner.narrative(
+    request,
+    evidence,
+    calculated_metrics,
+)
+
+
+Replace the included OpenAI-backed Reasoner with your current Bedrock or other model implementation. Replace the provider facade mappings with your existing appetite, discovery, and loss APIs.
+Workflow and routing
+The implemented graph is:
+Plan
+  ↓
+Business discovery, when required
+  ↓
+Resolve identity
+  └─ Pause if multiple candidates
+  ↓
+Validate classification
+  └─ Pause if discovered and submitted codes conflict
+  ↓
+Fetch appetite and losses
+  └─ Concurrent when both are required
+  ↓
+Calculate loss metrics
+  ↓
+Generate evidence-backed findings
+  ↓
+Validate output and finalize
+
+
+Routing is bounded by a deterministic policy:
+Intent
+Tools
+Full assessment
+Discovery, appetite, losses
+Appetite question
+Appetite only
+Loss question with business ID
+Losses only
+Loss question with address
+Discovery, then losses
+Operations question
+Discovery only
+Unsupported request
+No tools
+
+
+The model selects an intent enum. It cannot invent a tool, arbitrary URL, or unrestricted execution plan.
+For example, this standalone question retrieves losses without calling appetite:
+{
+  "mode": "QUESTION",
+  "business_id": "demo-business-1",
+  "question": "Do the losses suggest a recurring operational problem?",
+  "loss_start": "2021-01-01",
+  "loss_end": "2026-10-06"
+}
+
+
+
+
+
+
+A provider failure or missing rule produces a gap and a null category—not Undesirable. Generated findings cannot change the authoritative appetite response.
+Run it locally
+Extract the ZIP and run these commands from the project root:
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+cp .env.example .env
+
+docker compose up -d postgres
+python -m uw.runtime
+
+
+Start the API:
+uvicorn uw.api:app \
+  --host 127.0.0.1 \
+  --port 8000
+
+
+Start the worker in another terminal:
+python -m uw.worker
+
+
+Submit an assessment:
+curl -X POST http://localhost:8000/v1/runs \
+  -H 'Authorization: Bearer local-only-change-me' \
+  -H 'Idempotency-Key: assessment-example-1' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "mode": "FULL_ASSESSMENT",
+    "address": {
+      "street": "123 Example Road",
+      "city": "Bentonville",
+      "state": "AR",
+      "postal_code": "72712"
+    },
+    "class_code": "FAB-001",
+    "code_system": "CARRIER_CLASS",
+    "effective_date": "2026-11-01",
+    "line_of_business": "GENERAL_LIABILITY",
+    "loss_start": "2021-01-01",
+    "loss_end": "2026-10-06"
+  }'
+
+
+Use the returned run ID to inspect the report and audit timeline:
+GET /v1/runs/{run_id}
+GET /v1/runs/{run_id}/events
+
+
+The synthetic example produces:
+Appetite: Acceptable.
+Claims: two fire-related claims.
+Incurred total: USD 55,000.
+Disposition recommendation: REFER.
+Final underwriting decision: null.
+Change the street to contain ambiguous to exercise identity review. Submit a different class code to exercise classification review.
+Production boundaries
+The implementation deliberately defaults full assessments to referral. It does not bind coverage, calculate premium, issue policies, or automatically approve or decline risks.
+Before connecting live data:
+Disable demo authentication and mock providers.
+Map your actual API payloads to the normalized contracts.
+Enforce tenant/entity authorization at the provider boundary; a submitted business ID is not proof of access.
+Resolve and lock dependencies in your environment.
+Run the included tests plus PostgreSQL recovery, JWT, live-provider, and model integration tests.
+Add your existing telemetry, retention, secret-management, and operational controls.
+Two limitations are especially important:
+Evidence-reference validation rejects invented source IDs, but does not prove that every generated sentence is supported by its cited evidence. Model-generated conclusions still need evaluation and underwriter review.
+The package implements a persistent audit timeline, but does not include OpenTelemetry exporters, immutable regulatory archives, historical knowledge-as-of reconstruction, or cross-run conversation caching.
+The README documents these boundaries and the exact places to connect your existing application.
+⁂
+
+https://docs.langchain.com/oss/python/langgraph/interrupts 
+https://temporal.io/blog/temporal-langgraph-plugin-durable-execution 
+https://opentelemetry.io/docs/concepts/context-propagation/ 
+https://opentelemetry.io/docs/concepts/signals/traces/ 
+https://content.naic.org/sites/default/files/cmte-h-big-data-artificial-intelligence-wg-ai-model-bulletin.pdf.pdf 
+https://content.naic.org/insurance-topics/artificial-intelligence 
+https://www.hklaw.com/en/insights/publications/2025/05/the-implications-and-scope-of-the-naic-model-bulletin 
+https://www.zenml.io/blog/langgraph-durable-runtime 
+https://last9.io/blog/opentelemetry-context-propagation/ 
+https://regulations.ai/regulations/RAI-US-NA-NAICAIB-2023 
+https://www.thedataexperts.us/writing/naic-ai-model-bulletin-insurers.html 
+https://www.waterstreetcompany.com/what-the-naic-model-bulletin-means-for-insurance-ai/ 
+interests.insurance_technology 
+projects.risk_assessment_agent 
+https://www.perplexity.ai/search/c6aea056-60af-42cb-999e-ccf772a503a3 
+https://www.perplexity.ai/search/ac669594-1cbd-4859-821f-06c061576d26 
+https://www.perplexity.ai/search/39edf28f-18d6-46f4-b2a1-0afe96336cd9 
+https://opentelemetry.io/docs/languages/js/propagation/ 
+https://opentelemetry.io/docs/languages/js/context/ 
+https://www.plantemoran.com/explore-our-thinking/insight/2026/03/how-the-naic-ai-model-bulletin-is-evolving 
+https://docs.langchain.com/oss/python/langgraph/persistence 
+https://docs.langchain.com/oss/python/langgraph/interrupts  
+https://reference.langchain.com/python/langgraph/checkpoints 
+https://ranjankumar.in/fastapi-langgraph-client-disconnect-durability 
+https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/types.py 
+https://www.reddit.com/r/LangChain/comments/1t2wiog/built_a_production_incident_response_agent_with/ 
+https://forum.langchain.com/t/how-to-update-graph-state-while-preserving-interrupts/1655 
+https://forum.langchain.com/t/problems-encountered-when-study-is-interrupted/3084 
+https://stackoverflow.com/questions/79866929/update-state-messages-list-before-interrupt 
+https://docs.copilotkit.ai/langgraph-python/advanced/persistence/message-persistence 
+https://forum.langchain.com/t/does-the-postgres-checkpointer-serialize-concurrent-fastapi-requests/2882 
+https://forum.langchain.com/t/interrupt-does-not-work-correctly-in-langgraph/3816 
+https://github.com/CopilotKit/CopilotKit/issues/2402 
+https://www.learnwithparam.com/blog/langgraph-persistence-thread-models-production 
+https://dev.to/jamesbmour/interrupts-and-commands-in-langgraph-building-human-in-the-loop-workflows-4ngl 
